@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+.env/
+
+# VS Code
+.vscode/
+
+# Database credentials / local config
+dbConnect.py
