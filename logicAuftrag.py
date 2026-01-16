@@ -1,5 +1,5 @@
 from dbConnect import sessionLoader
-from mapper import Mitarbeiter, Auftrag, Kunde
+from mapper import Mitarbeiter, Auftrag, Kunde, Montage, Ersatzteil
 from checker import handleInputInteger, handleInputDatum
 import datetime
 from sqlalchemy import exc, or_
@@ -195,19 +195,24 @@ def planenAuftrag():
 
 def erledigenAuftrag():
     """
-    Task 7.3 – Auftrag erledigen
+    Task 7.3 + 7.4 – Auftrag erledigen inkl. Eingabe von Ersatzteilen
+
+    7.3:
     - Anzeige aller geplanten Aufträge der letzten 20 Tage bis einschließlich heute
     - Auswahl einer gültigen Auftragsnummer
-    - Eingabe von Dauer und Anfahrt (ganzzahlig)
-    - Speichern (Commit)
+    - Eingabe von Dauer und Anfahrt (int) und speichern
+
+    7.4:
+    - Danach können mehrere Ersatzteile (EtID + Anzahl) erfasst werden
+    - Lagerbestand prüfen (EtAnzLager muss ausreichen)
+    - Wenn irgendein Teil nicht ausreicht: KEIN Speichern (Rollback von Auftrag + Montage + Lagerbestand)
     """
     session = sessionLoader()
 
-    # Zeitraum: letzte 20 Tage bis heute (inkl.)
     heute = datetime.date.today()
     abdatum = heute - datetime.timedelta(days=20)
 
-    # "geplant" = MitId und Erledigungsdatum sind gesetzt (nicht NULL)
+    # "geplant" = MitId und Erledigungsdatum sind gesetzt
     menge_auftrag = (
         session.query(Auftrag)
         .filter(
@@ -228,7 +233,6 @@ def erledigenAuftrag():
     print("Geplante Aufträge der letzten 20 Tage:")
     liste_aufnr = [0]
     for auf in menge_auftrag:
-        # Kunde/Mitarbeiter sind über Relationships verfügbar
         mit_name = auf.Mitarbeiter.Name if auf.Mitarbeiter else "-"
         kun_name = auf.Kunde.Name if auf.Kunde else "-"
         print(f" {auf.AufNr} - AufDat: {auf.Auftragsdatum} | ErlDat: {auf.Erledigungsdatum} | MA: {mit_name} | Kunde: {kun_name}")
@@ -250,18 +254,100 @@ def erledigenAuftrag():
         session.close()
         return
 
-    # Task 7.3: Dauer und Anfahrt eingeben (beides int)
+    # Task 7.3: Dauer + Anfahrt
     dauer = handleInputInteger("Dauer eingeben")
     anfahrt = handleInputInteger("Anfahrt eingeben")
 
+    # Task 7.4: Ersatzteile erfassen (mehrere möglich)
+    # Wir sammeln erst alles, prüfen Lagerbestand, und speichern dann in EINER Transaktion.
+    teile_wunsch = {}  # EtID -> Gesamtanzahl
+
+    while True:
+        etid = input("Ersatzteil EtID eingeben (Enter = fertig): ").strip()
+        if etid == "":
+            break
+
+        anz = handleInputInteger("Anzahl eingeben")
+        if anz <= 0:
+            print("Anzahl muss > 0 sein.")
+            continue
+
+        # gleiche EtID mehrfach eingeben -> aufsummieren
+        teile_wunsch[etid] = teile_wunsch.get(etid, 0) + anz
+
+    # Wenn keine Ersatzteile eingegeben wurden, wird nur Dauer/Anfahrt gespeichert (ist erlaubt)
     try:
+        # ---- WICHTIG: Alles oder Nichts ----
+        # Wir verwenden commit/rollback auf einer Session:
+        # Wenn Lager nicht reicht: rollback -> Auftrag bleibt unverändert und keine Montage wird gespeichert.
+
+        # 1) Lagerbestand prüfen (nur wenn Ersatzteile eingegeben wurden)
+        fehlermeldungen = []
+        ersatzteile_objekte = {}  # EtID -> Ersatzteil-Objekt
+
+        if len(teile_wunsch) > 0:
+            for etid, anz_benoetigt in teile_wunsch.items():
+                et = session.query(Ersatzteil).get(etid)
+                if et is None:
+                    fehlermeldungen.append(f"Ersatzteil {etid} existiert nicht.")
+                    continue
+
+                ersatzteile_objekte[etid] = et
+
+                lager = et.EtAnzLager
+                if lager is None:
+                    lager = 0
+
+                if lager < anz_benoetigt:
+                    fehlermeldungen.append(
+                        f"Nicht genug Lagerbestand für {etid} ({et.EtBezeichnung}): "
+                        f"benötigt {anz_benoetigt}, verfügbar {lager}"
+                    )
+
+        # Wenn Fehler: NICHTS speichern
+        if len(fehlermeldungen) > 0:
+            print("\nFEHLER: Auftrag wurde NICHT gespeichert, da Lagerbestand nicht ausreicht / Daten ungültig sind:")
+            for msg in fehlermeldungen:
+                print(" -", msg)
+            session.rollback()
+            session.close()
+            return
+
+        # 2) Auftrag "erledigen" (Dauer/Anfahrt setzen)
         auftrag.Dauer = dauer
         auftrag.Anfahrt = anfahrt
+
+        # 3) Montage speichern + Lagerbestand reduzieren
+        if len(teile_wunsch) > 0:
+            for etid, anz_benoetigt in teile_wunsch.items():
+                et = ersatzteile_objekte[etid]
+
+                # Lager reduzieren
+                et.EtAnzLager = int(et.EtAnzLager) - int(anz_benoetigt)
+
+                # Montage: existiert evtl. schon (PK ist EtID+AufNr)
+                montage = session.query(Montage).get((etid, eingabe_aufnr))
+                if montage is None:
+                    montage = Montage()
+                    montage.EtId = etid
+                    montage.AufNr = eingabe_aufnr
+                    montage.Anzahl = anz_benoetigt
+                    session.add(montage)
+                else:
+                    montage.Anzahl = int(montage.Anzahl) + int(anz_benoetigt)
+
+        # 4) Commit -> alles wird gespeichert
         session.commit()
-        print(f"Auftrag {auftrag.AufNr} erledigt gespeichert: Dauer={dauer}, Anfahrt={anfahrt}\n")
+
+        print(f"\nAuftrag {eingabe_aufnr} gespeichert: Dauer={dauer}, Anfahrt={anfahrt}")
+        if len(teile_wunsch) > 0:
+            print("Ersatzteile wurden gespeichert und Lagerbestand wurde angepasst.\n")
+        else:
+            print("Keine Ersatzteile eingegeben.\n")
+
     except exc.SQLAlchemyError as e:
         session.rollback()
-        print("Fehler beim Speichern der Daten.")
+        print("Fehler beim Speichern. Es wurde nichts übernommen (Rollback).")
         print("Fehlerdetails:", e)
-
-    session.close()
+    finally:
+        session.close()
